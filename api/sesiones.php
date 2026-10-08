@@ -51,12 +51,52 @@ function turso($stmts) {
 
 turso([['sql'=>"CREATE TABLE IF NOT EXISTS sesiones(id TEXT PRIMARY KEY,data TEXT NOT NULL,created_at TEXT DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now')))"]]);
 
+// Protección de borrado: borrado lógico y límite de borrados
+// Las sesiones borradas no se eliminan de Turso, solo se marcan con la fecha en eliminado_en
+// y dejan de aparecer en la app. Para recuperar una: UPDATE sesiones SET eliminado_en=NULL WHERE id='N'
+define('LIMITE_POR_IP', 30);     // borrados por hora desde una misma conexión
+define('LIMITE_GLOBAL', 100);    // borrados por hora en total
+
+if (!file_exists('/tmp/.migracion_ok')) {
+    turso([
+        ['sql'=>"ALTER TABLE sesiones ADD COLUMN eliminado_en TEXT DEFAULT NULL"],   // si ya existe, Turso lo ignora
+        ['sql'=>"CREATE TABLE IF NOT EXISTS limite_borrado(ip TEXT NOT NULL, ts INTEGER NOT NULL)"],
+    ]);
+    $chk = turso([['sql'=>"SELECT COUNT(*) FROM pragma_table_info('sesiones') WHERE name='eliminado_en'"]]);
+    if ((int)($chk[0]['response']['result']['rows'][0][0]['value'] ?? 0) !== 1) {
+        http_response_code(500); echo json_encode(['error'=>'migracion pendiente']); exit;
+    }
+    @touch('/tmp/.migracion_ok');
+}
+
+function ip_cliente() {
+    $xff = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '';
+    if ($xff !== '') { $p = array_map('trim', explode(',', $xff)); return end($p); }
+    return $_SERVER['REMOTE_ADDR'] ?? 'desconocida';
+}
+
+function permitir_borrado() {
+    $ip = ip_cliente(); $ahora = time(); $hace1h = $ahora - 3600;
+    $res = turso([
+        ['sql'=>"SELECT COUNT(*) FROM limite_borrado WHERE ip=:ip AND ts>:t", 'args'=>[':ip'=>$ip, ':t'=>$hace1h]],
+        ['sql'=>"SELECT COUNT(*) FROM limite_borrado WHERE ts>:t",           'args'=>[':t'=>$hace1h]],
+    ]);
+    $porIp  = (int)($res[0]['response']['result']['rows'][0][0]['value'] ?? 0);
+    $global = (int)($res[1]['response']['result']['rows'][0][0]['value'] ?? 0);
+    if ($porIp >= LIMITE_POR_IP || $global >= LIMITE_GLOBAL) return false;
+    turso([
+        ['sql'=>"INSERT INTO limite_borrado(ip,ts) VALUES(:ip,:ts)", 'args'=>[':ip'=>$ip, ':ts'=>$ahora]],
+        ['sql'=>"DELETE FROM limite_borrado WHERE ts<:t",           'args'=>[':t'=>$ahora - 86400]],
+    ]);
+    return true;
+}
+
 $method=$_SERVER['REQUEST_METHOD'];
 $id=$_GET['id']??null;
 
 try {
     if($method==='GET'&&!$id&&!isset($_GET['maxid'])){
-        $res=turso([['sql'=>"SELECT data FROM sesiones ORDER BY created_at DESC"]]);
+        $res=turso([['sql'=>"SELECT data FROM sesiones WHERE eliminado_en IS NULL ORDER BY created_at DESC"]]);
         $rows=$res[0]['response']['result']['rows']??[];
         echo '['.implode(',',array_map(fn($r)=>$r[0]['value'],$rows)).']';
 
@@ -74,7 +114,7 @@ try {
 
     }elseif($method==='PATCH'&&$id){
         $body=json_decode(file_get_contents('php://input'),true);
-        $res=turso([['sql'=>"SELECT data FROM sesiones WHERE id=:id",'args'=>[':id'=>$id]]]);
+        $res=turso([['sql'=>"SELECT data FROM sesiones WHERE id=:id AND eliminado_en IS NULL",'args'=>[':id'=>$id]]]);
         $rows=$res[0]['response']['result']['rows']??[];
         if(empty($rows)){http_response_code(404);echo json_encode(['error'=>'not found']);exit;}
         $ses=json_decode($rows[0][0]['value'],true);
@@ -84,7 +124,8 @@ try {
         echo json_encode(['ok'=>true]);
 
     }elseif($method==='DELETE'&&$id){
-        turso([['sql'=>"DELETE FROM sesiones WHERE id=:id",'args'=>[':id'=>$id]]]);
+        if(!permitir_borrado()){http_response_code(429);echo json_encode(['error'=>'demasiados borrados, intente mas tarde']);exit;}
+        turso([['sql'=>"UPDATE sesiones SET eliminado_en=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=:id AND eliminado_en IS NULL",'args'=>[':id'=>$id]]]);
         echo json_encode(['ok'=>true]);
 
     }else{http_response_code(405);echo json_encode(['error'=>'not allowed']);}
